@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -185,27 +186,45 @@ class XthingsCloudApiClient:
                 )
                 response.raise_for_status()
                 result = await response.json()
-            except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
                 raise XthingsCloudApiError("Native device discovery failed") from err
+            if not isinstance(result, dict):
+                raise XthingsCloudApiError("Invalid native discovery response")
             code = result.get("code")
             if code in AUTH_ERROR_CODES:
                 raise XthingsCloudAuthError("Native discovery authentication failed", code)
-            if code != 200 or not isinstance(result.get("data"), list):
+            return entries(result.get("data") if code == 200 else None)
+
+        def entries(value: Any) -> list[dict[str, Any]]:
+            if not isinstance(value, list) or not all(
+                isinstance(v, dict) for v in value
+            ):
                 raise XthingsCloudApiError("Invalid native discovery response")
-            return result["data"]
+            return value
+
+        def identifier(
+            item: dict[str, Any], key: str, kinds: tuple[type, ...]
+        ) -> Any:
+            value = item.get(key)
+            if type(value) not in kinds or value in ("", 0):
+                raise XthingsCloudApiError("Invalid native discovery response")
+            return value
 
         routes = {}
         for address in await request("address", {}):
-            for room in await request("room", {"id": address["id"]}):
-                for device in await request("device/list", {"room_id": room["id"]}):
+            address_id = identifier(address, "id", (int,))
+            for room in await request("room", {"id": address_id}):
+                room_id = identifier(room, "id", (int, str))
+                for device in await request("device/list", {"room_id": room_id}):
                     if device.get("model") in SUPPORTED_MODELS:
-                        routes[device["uuid"]] = NativeBulbRoute(address["id"])
+                        uuid = identifier(device, "uuid", (str,))
+                        routes[uuid] = NativeBulbRoute(address_id)
                     elif device.get("entry_type") == "Britegroup":
-                        for bulb in device.get("lights", []):
+                        group_id = identifier(device, "uuid", (str,))
+                        for bulb in entries(device.get("lights", [])):
                             if bulb.get("model") in SUPPORTED_MODELS:
-                                routes[bulb["uuid"]] = NativeBulbRoute(
-                                    address["id"], device["uuid"]
-                                )
+                                uuid = identifier(bulb, "uuid", (str,))
+                                routes[uuid] = NativeBulbRoute(address_id, group_id)
         return routes
 
     # ---- Switch ----

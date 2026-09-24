@@ -14,6 +14,16 @@ from ha_xthings_cloud.bulb import NativeBulbClient
 STATE = {"pw": 1, "br": 26, "ct": 1, "tp": 47, "hu": 0, "sa": 0, "li": 0}
 
 
+async def until(predicate, timeout):
+    """Poll until predicate() is true; asyncio.timeout() needs Python 3.11."""
+
+    async def wait():
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait(), timeout)
+
+
 class Broker:
     def __init__(self):
         self.state = dict(STATE)
@@ -227,9 +237,7 @@ async def test_disconnect_resubscribes_and_confirms_new_state(monkeypatch):
         await bulb.async_start()
         broker.state["tp"] = 100
         await broker.queue.put(aiomqtt.MqttError("connection lost"))
-        async with asyncio.timeout(3):
-            while bulb.state != {**STATE, "tp": 100}:
-                await asyncio.sleep(0.01)
+        await until(lambda: bulb.state == {**STATE, "tp": 100}, 3)
         assert None in reports
         assert broker.connections == 2
     finally:
@@ -307,12 +315,10 @@ async def test_shutdown_releases_inflight_read(monkeypatch):
     broker.drop = True
     previous = len(broker.requests)
     read = asyncio.create_task(bulb.async_refresh())
-    async with asyncio.timeout(1):
-        while len(broker.requests) == previous:
-            await asyncio.sleep(0)
-        await bulb.async_stop()
-        with pytest.raises(XthingsCloudApiError):
-            await read
+    await until(lambda: len(broker.requests) != previous, 1)
+    await asyncio.wait_for(bulb.async_stop(), 1)
+    with pytest.raises(XthingsCloudApiError):
+        await asyncio.wait_for(read, 1)
     assert bulb.state is None
     assert reports[-1] is None
 
@@ -585,9 +591,7 @@ async def test_failed_health_poll_retries_before_marking_unavailable(monkeypatch
     try:
         await bulb.async_start()
         broker.drop = True
-        async with asyncio.timeout(1):
-            while bulb.state is not None:
-                await asyncio.sleep(0.01)
+        await until(lambda: bulb.state is None, 1)
         polls = [r for r in broker.requests if r["hd"]["na"] == "sy"]
         assert len(polls) == 4
     finally:

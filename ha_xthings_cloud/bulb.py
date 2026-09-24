@@ -31,6 +31,8 @@ RANGES = {
 }
 # Consecutive failed queries before a connected bulb is reported unavailable.
 FAILED_QUERY_LIMIT = 3
+# Complete state replies are about 150 bytes; larger payloads are not trusted.
+MAX_PAYLOAD_BYTES = 4096
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,9 @@ class NativeBulbClient:
         self._failed_queries = 0
         self._confirmed_at = 0.0
         self._state_held = False
+        # Incremented on disconnect so replies from an old connection are ignored.
+        self._generation = 0
+        self._closing = False
         self._controls: set[asyncio.Task] = set()
         self._queued_control: asyncio.Task | None = None
         self._queued_changes: dict[str, int] = {}
@@ -157,30 +162,35 @@ class NativeBulbClient:
 
     async def async_start(self) -> None:
         """Start recovery and health polling; await the first bounded attempt."""
-        if self._task is not None:
+        if self._task is not None and not self._task.done():
             return
+        self._closing = False
         self._initial.clear()
         self._task = asyncio.create_task(self._run(), name="xthings-bulb")
-        with suppress(TimeoutError):
+        with suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._initial.wait(), self._timeout * 2)
 
     async def async_stop(self) -> None:
         """Close the connection and all background tasks."""
-        controls = list(self._controls)
-        for control in controls:
-            control.cancel()
-        await asyncio.gather(*controls, return_exceptions=True)
+        self._closing = True
+        while self._controls:
+            controls = list(self._controls)
+            for control in controls:
+                control.cancel()
+            await asyncio.gather(*controls, return_exceptions=True)
         self._queued_control = None
         self._queued_changes = {}
         if self._task is not None:
-            self._task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._task
+            task = self._task
+            task.cancel()
+            # gather() propagates cancellation of this caller but returns
+            # the task's own outcome instead of raising it.
+            await asyncio.gather(task, return_exceptions=True)
             self._task = None
 
     async def _run(self) -> None:
         delay = 1
-        while True:
+        while not self._closing:
             monitor = None
             try:
                 async with aiomqtt.Client(
@@ -207,24 +217,30 @@ class NativeBulbClient:
             finally:
                 self._connected.clear()
                 self._client = None
+                self._generation += 1
                 self._set_state(None)
                 for future in self._pending.values():
                     if not future.done():
                         future.set_exception(XthingsCloudApiError("MQTT disconnected"))
                 if monitor is not None:
                     monitor.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await monitor
+                    # Unlike suppress(CancelledError), this does not swallow a
+                    # cancellation of this task, so shutdown cannot reconnect.
+                    await asyncio.gather(monitor, return_exceptions=True)
                 self._initial.set()
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
 
     def _receive(self, topic: str, payload: bytes, retained: bool) -> None:
-        if retained or topic not in (self._accept, self._notify):
+        if (
+            retained
+            or topic not in (self._accept, self._notify)
+            or len(payload) > MAX_PAYLOAD_BYTES
+        ):
             return
         try:
             message = json.loads(payload)
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             return
         if not isinstance(message, dict):
             return
@@ -267,7 +283,7 @@ class NativeBulbClient:
                 )
                 if wait <= 0:
                     break
-                with suppress(TimeoutError):
+                with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self._changed.wait(), wait)
                 if failed:
                     break
@@ -275,6 +291,7 @@ class NativeBulbClient:
 
     async def async_refresh(self) -> dict[str, int]:
         """Request fresh state; HTTP cache and MQTT retained messages are excluded."""
+        self._raise_if_closing()
         async with self._lock:
             return await self._sync()
 
@@ -292,6 +309,7 @@ class NativeBulbClient:
             low, high = RANGES[key]
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"Invalid {key} setting")
+        self._raise_if_closing()
         if self._can_merge(changes):
             self._queued_changes.update(changes)
             control = self._queued_control
@@ -302,6 +320,10 @@ class NativeBulbClient:
             self._controls.add(control)
             control.add_done_callback(self._control_done)
         return dict(await asyncio.shield(control))
+
+    def _raise_if_closing(self) -> None:
+        if self._closing:
+            raise XthingsCloudApiError("Bulb connection is stopping")
 
     def _can_merge(self, changes: dict[str, int]) -> bool:
         """Whether changes can join the pending command without reordering power."""
@@ -363,7 +385,7 @@ class NativeBulbClient:
                 {"pw": desired["pw"], "br": changes.get("br", 255)},
                 _new_mid(),
             )
-        except (TimeoutError, aiomqtt.MqttError) as err:
+        except (asyncio.TimeoutError, aiomqtt.MqttError) as err:
             raise XthingsCloudApiError("Bulb command failed") from err
         return await self._confirm_state(changes)
 
@@ -390,25 +412,36 @@ class NativeBulbClient:
         mids = [_new_mid()]
         try:
             await asyncio.wait_for(self._connected.wait(), self._timeout)
+            generation = self._generation
             deadline = loop.time() + self._timeout
-            self._pending[mids[0]] = future
-            await self._publish("FC", "sy", {}, mids[0])
+
+            def remaining() -> float:
+                if (left := deadline - loop.time()) <= 0:
+                    raise asyncio.TimeoutError
+                return left
+
+            async def query(mid: int) -> None:
+                self._pending[mid] = future
+                left = remaining()
+                await asyncio.wait_for(self._publish("FC", "sy", {}, mid), left)
+
+            await query(mids[0])
             try:
                 state = await asyncio.wait_for(
                     asyncio.shield(future),
-                    min(self._backup_query_delay, self._timeout),
+                    min(self._backup_query_delay, remaining()),
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 # A19-C1 drops replies to queries arriving within about 0.2 s of
                 # a command, and a dropped reply never arrives late. A backup
                 # query sent later is answered; the first reply still counts.
-                if deadline - loop.time() <= 0:
-                    raise
                 mids.append(_new_mid())
-                self._pending[mids[1]] = future
-                await self._publish("FC", "sy", {}, mids[1])
-                state = await asyncio.wait_for(future, deadline - loop.time())
-        except (TimeoutError, aiomqtt.MqttError, XthingsCloudApiError) as err:
+                await query(mids[1])
+                state = await asyncio.wait_for(future, remaining())
+            if generation != self._generation:
+                # The reply arrived, but the connection dropped before we resumed.
+                raise XthingsCloudApiError("MQTT disconnected")
+        except (asyncio.TimeoutError, aiomqtt.MqttError, XthingsCloudApiError) as err:
             self._failed_queries += 1
             if self._failed_queries >= FAILED_QUERY_LIMIT:
                 self._set_state(None)
