@@ -84,6 +84,7 @@ class NativeBulbClient:
         timeout: float = 5,
         poll_interval: float = 30,
         retry_interval: float = 2,
+        backup_query_delay: float = 1,
     ) -> None:
         if any(c in device_id for c in "/+#") or not device_id:
             raise ValueError("Invalid device ID")
@@ -109,6 +110,7 @@ class NativeBulbClient:
         self._timeout = timeout
         self._poll_interval = poll_interval
         self._retry_interval = retry_interval
+        self._backup_query_delay = backup_query_delay
         self._sid = secrets.randbelow(86400)
         prefix = (
             f"utec/lightness/group/{route.group_id}/{device_id}"
@@ -363,20 +365,38 @@ class NativeBulbClient:
         raise XthingsCloudApiError("Bulb did not confirm the requested settings")
 
     async def _sync(self) -> dict[str, int]:
-        mid = _new_mid()
-        future = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        # Every query shares one future, so any matching reply confirms.
+        future = loop.create_future()
+        mids = [_new_mid()]
         try:
             await asyncio.wait_for(self._connected.wait(), self._timeout)
-            self._pending[mid] = future
-            await self._publish("FC", "sy", {}, mid)
-            state = await asyncio.wait_for(future, self._timeout)
+            deadline = loop.time() + self._timeout
+            self._pending[mids[0]] = future
+            await self._publish("FC", "sy", {}, mids[0])
+            try:
+                state = await asyncio.wait_for(
+                    asyncio.shield(future),
+                    min(self._backup_query_delay, self._timeout),
+                )
+            except TimeoutError:
+                # A19-C1 drops replies to queries arriving within about 0.2 s of
+                # a command, and a dropped reply never arrives late. A backup
+                # query sent later is answered; the first reply still counts.
+                if deadline - loop.time() <= 0:
+                    raise
+                mids.append(_new_mid())
+                self._pending[mids[1]] = future
+                await self._publish("FC", "sy", {}, mids[1])
+                state = await asyncio.wait_for(future, deadline - loop.time())
         except (TimeoutError, aiomqtt.MqttError, XthingsCloudApiError) as err:
             self._failed_queries += 1
             if self._failed_queries >= FAILED_QUERY_LIMIT:
                 self._set_state(None)
             raise XthingsCloudApiError("No confirmed response from bulb") from err
         finally:
-            self._pending.pop(mid, None)
+            for mid in mids:
+                self._pending.pop(mid, None)
             if not future.done():
                 future.cancel()
             elif not future.cancelled():

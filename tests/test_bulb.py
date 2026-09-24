@@ -27,6 +27,7 @@ class Broker:
         self.reply_topic = 1
         self.lost_reads_after_command = 0
         self.lost_reads_remaining = 0
+        self.reply_delays = []
 
     def client(self, **kwargs):
         return self
@@ -77,15 +78,17 @@ class Broker:
         if self.lost_reads_remaining:
             self.lost_reads_remaining -= 1
             request["hd"]["md"] = -1
-        await self.queue.put(
-            SimpleNamespace(
-                topic=self.subscriptions[self.reply_topic],
-                retain=False,
-                payload=json.dumps(
-                    {"hd": {**request["hd"], "np": "NT"}, "pd": self.state}
-                ).encode(),
-            )
+        reply = SimpleNamespace(
+            topic=self.subscriptions[self.reply_topic],
+            retain=False,
+            payload=json.dumps(
+                {"hd": {**request["hd"], "np": "NT"}, "pd": self.state}
+            ).encode(),
         )
+        if self.reply_delays and (delay := self.reply_delays.pop(0)):
+            asyncio.get_running_loop().call_later(delay, self.queue.put_nowait, reply)
+            return
+        await self.queue.put(reply)
 
 
 @pytest.mark.asyncio
@@ -587,5 +590,89 @@ async def test_failed_health_poll_retries_before_marking_unavailable(monkeypatch
                 await asyncio.sleep(0.01)
         polls = [r for r in broker.requests if r["hd"]["na"] == "sy"]
         assert len(polls) == 4
+    finally:
+        await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_lost_reply_is_recovered_by_backup_query(monkeypatch):
+    broker = Broker()
+    broker.lost_reads_after_command = 1
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    reports = []
+    bulb = NativeBulbClient(
+        "bulb",
+        123,
+        ssl.create_default_context(),
+        reports.append,
+        timeout=2,
+        backup_query_delay=0.05,
+    )
+    try:
+        await bulb.async_start()
+        broker.requests.clear()
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        assert await bulb.async_set_state({"pw": 1, "br": 15}) == {**STATE, "br": 15}
+        # Recovered by the backup query, not by waiting out the timeout.
+        assert loop.time() - start < 1
+        assert [r["hd"]["na"] for r in broker.requests] == ["pw", "sy", "sy"]
+        assert None not in reports
+        assert not bulb._pending
+    finally:
+        await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_slow_first_reply_still_confirms_after_backup_query(monkeypatch):
+    broker = Broker()
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    bulb = NativeBulbClient(
+        "bulb",
+        123,
+        ssl.create_default_context(),
+        lambda s: None,
+        timeout=2,
+        backup_query_delay=0.05,
+    )
+    try:
+        await bulb.async_start()
+        broker.requests.clear()
+        # The first reply is slow and the backup reply never arrives.
+        broker.reply_delays = [0.1]
+        broker.lost_reads_remaining = 0
+        original_publish = broker.publish
+
+        async def drop_backup(topic, payload, **kwargs):
+            if len(broker.requests) == 1:
+                broker.requests.append(json.loads(payload))
+                return
+            await original_publish(topic, payload, **kwargs)
+
+        monkeypatch.setattr(broker, "publish", drop_backup)
+        assert await bulb.async_refresh() == STATE
+        assert [r["hd"]["na"] for r in broker.requests] == ["sy", "sy"]
+        assert not bulb._pending
+    finally:
+        await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_prompt_reply_needs_no_backup_query(monkeypatch):
+    broker = Broker()
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    bulb = NativeBulbClient(
+        "bulb",
+        123,
+        ssl.create_default_context(),
+        lambda s: None,
+        backup_query_delay=0.2,
+    )
+    try:
+        await bulb.async_start()
+        broker.requests.clear()
+        assert await bulb.async_refresh() == STATE
+        await asyncio.sleep(0.3)
+        assert [r["hd"]["na"] for r in broker.requests] == ["sy"]
     finally:
         await bulb.async_stop()
