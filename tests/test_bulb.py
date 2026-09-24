@@ -416,10 +416,95 @@ async def test_overlapping_controls_preserve_each_change(monkeypatch):
             bulb.async_set_state({"pw": 0}),
         )
         assert results == [
-            {**STATE, "br": 42},
+            {**STATE, "br": 42, "tp": 100},
             {**STATE, "br": 42, "tp": 100},
             {**STATE, "br": 42, "tp": 100, "pw": 0},
         ]
         assert await bulb.async_refresh() == {**STATE, "br": 42, "tp": 100, "pw": 0}
+    finally:
+        await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_complete_power_command_needs_only_confirmation(monkeypatch):
+    broker = Broker()
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    bulb = NativeBulbClient("bulb", 123, ssl.create_default_context(), lambda s: None)
+    try:
+        await bulb.async_start()
+        broker.requests.clear()
+        assert await bulb.async_set_state({"pw": 1, "br": 18}) == {**STATE, "br": 18}
+        assert [r["hd"]["na"] for r in broker.requests] == ["pw", "sy"]
+    finally:
+        await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+async def test_slider_burst_coalesces_pending_changes(monkeypatch, cancel_waiter):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class SlowCommandBroker(Broker):
+        async def publish(self, topic, payload, **kwargs):
+            if json.loads(payload)["hd"]["np"] == "CC" and not entered.is_set():
+                entered.set()
+                await release.wait()
+            await super().publish(topic, payload, **kwargs)
+
+    broker = SlowCommandBroker()
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    bulb = NativeBulbClient("bulb", 123, ssl.create_default_context(), lambda s: None)
+    tasks = []
+    try:
+        await bulb.async_start()
+        tasks.append(asyncio.create_task(bulb.async_set_state({"pw": 1, "br": 10})))
+        await asyncio.wait_for(entered.wait(), 1)
+        for brightness in range(11, 21):
+            tasks.append(
+                asyncio.create_task(bulb.async_set_state({"pw": 1, "br": brightness}))
+            )
+            await asyncio.sleep(0)
+        tasks.append(
+            asyncio.create_task(bulb.async_set_state({"pw": 1, "ct": 1, "tp": 70}))
+        )
+        await asyncio.sleep(0)
+        if cancel_waiter:
+            tasks[1].cancel()
+        release.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert results[0] == {**STATE, "br": 10}
+        for result in results[2 if cancel_waiter else 1 :]:
+            assert result == {**STATE, "br": 20, "tp": 70}
+        assert await bulb.async_refresh() == {**STATE, "br": 20, "tp": 70}
+        commands = [r for r in broker.requests if r["hd"]["np"] == "CC"]
+        assert [r["hd"]["na"] for r in commands] == ["pw", "se", "pw"]
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_power_changes_are_ordering_barriers(monkeypatch):
+    broker = Broker()
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    bulb = NativeBulbClient("bulb", 123, ssl.create_default_context(), lambda s: None)
+    try:
+        await bulb.async_start()
+        results = await asyncio.gather(
+            bulb.async_set_state({"pw": 1, "br": 15}),
+            bulb.async_set_state({"pw": 0}),
+            bulb.async_set_state({"pw": 1, "br": 20}),
+        )
+        assert results == [
+            {**STATE, "br": 15},
+            {**STATE, "br": 15, "pw": 0},
+            {**STATE, "br": 20},
+        ]
+        assert [r["pd"]["pw"] for r in broker.requests if r["hd"]["na"] == "pw"] == [
+            1,
+            0,
+            1,
+        ]
     finally:
         await bulb.async_stop()

@@ -118,6 +118,9 @@ class NativeBulbClient:
         self._lock = asyncio.Lock()
         self._pending: dict[int, asyncio.Future] = {}
         self._state: dict[str, int] | None = None
+        self._controls: set[asyncio.Task] = set()
+        self._queued_control: asyncio.Task | None = None
+        self._queued_changes: dict[str, int] = {}
 
     @property
     def state(self) -> dict[str, int] | None:
@@ -139,6 +142,12 @@ class NativeBulbClient:
 
     async def async_stop(self) -> None:
         """Close the connection and all background tasks."""
+        controls = list(self._controls)
+        for control in controls:
+            control.cancel()
+        await asyncio.gather(*controls, return_exceptions=True)
+        self._queued_control = None
+        self._queued_changes = {}
         if self._task is not None:
             self._task.cancel()
             with suppress(asyncio.CancelledError):
@@ -230,18 +239,57 @@ class NativeBulbClient:
             return await self._sync()
 
     async def async_set_state(self, changes: dict[str, int]) -> dict[str, int]:
-        """Apply native settings, preserving others, and confirm with fresh reads."""
+        """Apply settings and return confirmed state, preserving unrelated fields.
+
+        Pending slider changes coalesce by field; callers share the resulting
+        confirmed state, which may supersede intermediate values. An in-flight
+        batch and explicit power actions retain their order. Cancelling a caller
+        does not cancel a shared device operation.
+        """
         if not changes or not changes.keys() <= RANGES.keys():
             raise ValueError("Unknown or empty bulb settings")
         for key, value in changes.items():
             low, high = RANGES[key]
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"Invalid {key} setting")
+        queued = self._queued_changes
+        if (
+            self._queued_control is not None
+            and changes.keys() != {"pw"}
+            and queued.keys() != {"pw"}
+            and (
+                "pw" not in changes
+                or "pw" not in queued
+                or changes["pw"] == queued["pw"]
+            )
+        ):
+            queued.update(changes)
+            control = self._queued_control
+        else:
+            self._queued_changes = dict(changes)
+            control = asyncio.create_task(self._apply_changes(self._queued_changes))
+            self._queued_control = control
+            self._controls.add(control)
+            control.add_done_callback(self._control_done)
+        return dict(await asyncio.shield(control))
+
+    def _control_done(self, control: asyncio.Task) -> None:
+        self._controls.discard(control)
+        if not control.cancelled():
+            # The requesting service may have been cancelled while we confirmed.
+            control.exception()
+
+    async def _apply_changes(self, changes: dict[str, int]) -> dict[str, int]:
         async with self._lock:
-            state = await self._sync()
+            if self._queued_control is asyncio.current_task():
+                self._queued_control = None
+                self._queued_changes = {}
+            scene = bool(changes.keys() - {"pw", "br"})
+            state = await self._sync() if scene or "pw" not in changes else {}
             desired = {**state, **changes}
             try:
-                if changes.keys() - {"pw", "br"}:
+                await asyncio.wait_for(self._connected.wait(), self._timeout)
+                if scene:
                     await self._publish(
                         "CC", "se", desired, secrets.randbelow(2**31 - 1) + 1
                     )
@@ -258,7 +306,7 @@ class NativeBulbClient:
                         {"pw": desired["pw"], "br": changes.get("br", 255)},
                         secrets.randbelow(2**31 - 1) + 1,
                     )
-            except aiomqtt.MqttError as err:
+            except (TimeoutError, aiomqtt.MqttError) as err:
                 self._set_state(None)
                 raise XthingsCloudApiError("Bulb command failed") from err
             return await self._confirm_state(changes)

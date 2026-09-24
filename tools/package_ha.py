@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory(dir=args.output.parent) as tmp:
     shutil.copy2(args.wheel, target / args.wheel.name)
     manifest_path = target / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["version"] = "2026.9.3.dev7"
+    manifest["version"] = "2026.9.3.dev8"
     manifest["requirements"] = [
         f"ha-xthings-cloud @ file:///config/custom_components/xthings_cloud/{args.wheel.name}"
     ]
