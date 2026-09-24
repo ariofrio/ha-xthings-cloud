@@ -37,7 +37,7 @@ The Core source remains the development source. [tools/package_ha.py](../tools/p
 3. From the client checkout, package it:
 
    ```sh
-   python tools/package_ha.py /path/to/core dist/ha_xthings_cloud-1.0.6.dev4-py3-none-any.whl dist/xthings_cloud.tar.gz
+   python tools/package_ha.py /path/to/core dist/ha_xthings_cloud-1.0.6.dev5-py3-none-any.whl dist/xthings_cloud.tar.gz
    ```
 
 4. Create an HA backup. If an `xthings_cloud` custom integration already exists, preserve it before replacing it. Extract the archive into HA's `/config`; it creates `/config/custom_components/xthings_cloud/` and bundles the wheel there. The generated manifest references that local wheel.
@@ -55,14 +55,14 @@ On 2026-09-24, testing against HA 2026.9.3 / HAOS 18.3 and four A19-C1 bulbs run
 - Startup readback through the installed custom integration for one standalone bulb and three members of an Xthings group.
 - Individual HA off/on commands for all four bulbs, with independent device readback, unchanged neighboring bulbs, and exact restoration of starting settings.
 - HA commands for both temperature endpoints, saturated and desaturated colors, brightness, and power, independently checked with a second native MQTT client.
-- An external temperature change appearing in HA after 29.7 seconds.
-- Fresh temperature recovery after an integration reload.
+- An external setting change appearing in HA after 6.1 seconds in the full functionality suite.
+- A 54-scenario live suite across four individual bulbs and their HA group: power, brightness endpoints and zero, temperature endpoints, saturated/desaturated colors, settings applied from off, overlapping slider requests, external state changes, and recovery after an integration reload. Every action was checked against fresh native state; unrelated bulbs retained their settings.
 - Exact restoration of the original native state after testing.
 
-Five control measurements took 1.52–2.14 seconds from HA service call through the independent verification query. These are protocol round-trip measurements, not optical response latency.
+The 55 Home Assistant service calls in that suite completed within 3.58 seconds each. These measure confirmed service completion, not optical response latency.
 
-Validation passed 22 client tests and 59 HA integration tests (including 21 snapshots). Applicable Core hooks for the changed files cover Ruff, formatting, spelling, JSON, mypy, pylint, requirements generation, and hassfest. Whole-repository validation encounters existing errors outside this integration; these results do not establish a clean repository-wide run.
+Validation passed 24 client tests and 59 HA integration tests (including 21 snapshots). Applicable Core hooks for the changed files cover Ruff, formatting, spelling, JSON, mypy, pylint, requirements generation, and hassfest. Whole-repository validation encounters existing errors outside this integration; these results do not establish a clean repository-wide run.
 
-Automated tests cover standalone/group route discovery, dedicated power commands (including combined power and color settings), response validation, retained/stale reply rejection, reconnect, missing-reply recovery, lost confirmation replies, command confirmation failures, state preservation, and shutdown. Core tests cover capabilities without a temperature reading, color conversion and confirmed readback, stale HTTP/WebSocket isolation, options validation, unavailable startup, unload cleanup, account refresh scheduling, reauthentication, account mismatch rejection, and isolation/recovery of native setup failures.
+Automated tests cover standalone/group route discovery, dedicated power commands (including combined power and color settings), response validation, retained/stale reply rejection, reconnect, missing-reply recovery, lost confirmation replies, command confirmation failures, state preservation, overlapping controls, and shutdown during in-flight publication. Core tests cover capabilities without a temperature reading, color conversion and confirmed readback, stale HTTP/WebSocket isolation, options validation, unavailable startup, unload cleanup, account refresh scheduling, reauthentication, account mismatch rejection, and isolation/recovery of native setup failures.
 
 The client suite also verifies that the real packaged certificate/key load while preserving server verification. The built wheel was checked for inclusion of exactly the shared pair and successfully loaded directly as a ZIP package; account tokens and other private files are excluded.

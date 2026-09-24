@@ -294,6 +294,9 @@ class NativeBulbClient:
             self._pending.pop(mid, None)
             if not future.done():
                 future.cancel()
+            elif not future.cancelled():
+                # Disconnect can complete the future while publish is cancelled.
+                future.exception()
         self._set_state(state)
         return dict(state)
 

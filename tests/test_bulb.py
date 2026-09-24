@@ -369,3 +369,57 @@ async def test_combined_control_confirms_scene_before_power(monkeypatch):
         assert names[names.index("se") : names.index("pw") + 1] == ["se", "sy", "pw"]
     finally:
         await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_publish_does_not_leak_future_exception(monkeypatch):
+    publishing = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowPublishBroker(Broker):
+        async def publish(self, *args, **kwargs):
+            publishing.set()
+            await release.wait()
+
+    broker = SlowPublishBroker()
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    unhandled = []
+    loop.set_exception_handler(lambda loop, context: unhandled.append(context))
+    bulb = NativeBulbClient(
+        "bulb", 123, ssl.create_default_context(), lambda s: None, timeout=0.03
+    )
+    try:
+        startup = asyncio.create_task(bulb.async_start())
+        await asyncio.wait_for(publishing.wait(), 1)
+        await bulb.async_stop()
+        await startup
+        await asyncio.sleep(0)
+        assert not unhandled
+        assert bulb.state is None
+    finally:
+        await bulb.async_stop()
+        loop.set_exception_handler(previous)
+
+
+@pytest.mark.asyncio
+async def test_overlapping_controls_preserve_each_change(monkeypatch):
+    broker = Broker()
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    bulb = NativeBulbClient("bulb", 123, ssl.create_default_context(), lambda s: None)
+    try:
+        await bulb.async_start()
+        results = await asyncio.gather(
+            bulb.async_set_state({"br": 42}),
+            bulb.async_set_state({"pw": 1, "ct": 1, "tp": 100}),
+            bulb.async_set_state({"pw": 0}),
+        )
+        assert results == [
+            {**STATE, "br": 42},
+            {**STATE, "br": 42, "tp": 100},
+            {**STATE, "br": 42, "tp": 100, "pw": 0},
+        ]
+        assert await bulb.async_refresh() == {**STATE, "br": 42, "tp": 100, "pw": 0}
+    finally:
+        await bulb.async_stop()
