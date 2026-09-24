@@ -1,6 +1,6 @@
 # Experimental A19-C1 native MQTT support
 
-This branch extends the existing Xthings client and Home Assistant integration with confirmed state readback for the U-tec Bright A19-C1. Other models retain the existing HTTP/WebSocket behavior. The matching [Home Assistant Core branch](https://github.com/ariofrio/core/tree/ariofrio/xthings-bulb-mqtt) is based on HA 2026.9.3.
+This branch extends the existing Xthings client and Home Assistant integration with confirmed state readback for the U-tec Bright A19-C1. Other models retain the existing HTTP/WebSocket behavior. The matching [Home Assistant Core development branch](https://github.com/ariofrio/core/tree/ariofrio/xthings-bulb-mqtt) targets upstream `dev`. The [HA 2026.9.3 deployment branch](https://github.com/ariofrio/core/tree/ariofrio/xthings-bulb-mqtt-ha2026.9.3) preserves the version installed and tested below.
 
 The transport is **cloud MQTT**, not a LAN or Bluetooth connection. It requires internet access and caller-supplied TLS client credentials. No certificate or private key is distributed in either fork. There is no implemented public credential provisioning or renewal flow; a vendor certificate revocation would require replacement credentials. This remains an experimental deployment, not an upstream-supported release.
 
@@ -20,7 +20,7 @@ Account-scoped route discovery uses the existing authenticated client. Returned 
 
 The Core source remains the development source. [tools/package_ha.py](../tools/package_ha.py) generates a custom integration archive from it and the client wheel; there is no second manually maintained implementation. This layout is for direct installation, not HACS.
 
-1. Check out the client branch and matching Core branch. Run the client tests and the Core Xthings integration tests. Follow Core's contributor setup instructions, including generating English translations when changing strings.
+1. Check out the client branch and a Core branch matching your HA version. For HA 2026.9.3, use the deployment branch linked above. Run the client tests and the Core Xthings integration tests. Follow Core's contributor setup instructions, including generating English translations when changing strings.
 2. Build the client wheel with `uv build --wheel --out-dir dist`.
 3. From the client checkout, package it:
 
@@ -35,7 +35,7 @@ The Core source remains the development source. [tools/package_ha.py](../tools/p
 
 For rollback, disable native MQTT in the options, move the custom `xthings_cloud` directory outside `/config/custom_components`, and restart HA. HA will load the built-in integration and its dependency requirement again. The backup can restore the complete previous HA configuration if needed. Preserve the private credential files only if you intend to reinstall.
 
-For a future upstream contribution, the library change must be reviewed and released before Core can depend on it. The Core change also needs rebasing onto the then-current development branch. No upstream PR has been submitted by this work.
+The [client draft PR](https://github.com/XthingsJacobs/ha-xthings-cloud/pull/1) needs review and a published release before the companion Core change can merge. Credential provisioning and renewal remain unresolved.
 
 ## Validation
 
