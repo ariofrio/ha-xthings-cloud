@@ -16,6 +16,18 @@ The tested native fields are power (`pw`), brightness (`br`), mode (`ct`), tempe
 
 Account-scoped route discovery uses the existing authenticated client. Returned routing data contains only supported device identifiers and address IDs; unrelated metadata is discarded. Discovery is in `XthingsCloudApiClient.async_get_native_bulb_routes()` in [client.py](../ha_xthings_cloud/client.py).
 
+Authentication failures start HA's reauthentication flow, which requires the same account and preserves the entry's options. Other native setup failures leave HTTP/WebSocket devices available and missing native bulbs unavailable. Native setup retries on the next account poll, or immediately when the integration is reloaded.
+
+## Kelvin mapping evidence
+
+The native setting is read back exactly, but the nominal Kelvin conversion remains unverified. The linear formula is an integration assumption, not a vendor-provided formula or an optical calibration.
+
+On 2026-09-24, the complete [vendor Foundational API reference](https://support.xthings.com/hc/en-us/articles/39867633454361-Developer-Foundational-APIs) and the other 18 articles in its developer section provided no native-slider-to-Kelvin conversion. The reference describes `colorTemperatureRange`, but its sample A19-C1 range is 2000–9000, inconsistent with the [product's advertised 2700–6500 K range](https://u-tec.com/products/bright-a19-color). The sample cannot establish this bulb's mapping.
+
+A fresh OpenAPI discovery still classified the tested A19-C1 as `utec-dimmer`, with only a 1–100 brightness range. A fresh state query returned health, power, and brightness, with no color temperature. The [vendor's handler reference](https://support.xthings.com/hc/en-us/articles/39872638936217-Device-Handler-Types-Reference) assigns no color-temperature capability to that handler. The app's native device metadata reports the slider value without Kelvin metadata; its white-picker code sends a percentage and its color helper draws the UI gradient.
+
+A vendor-defined formula or table for A19-C1 firmware 01.42.0301, or an authoritative API reading tied to native `tp`, is still needed to replace the estimate. Neither generic range examples nor SmartThings values without confirmed native changes establish that relationship.
+
 ## Installing on HAOS
 
 The Core source remains the development source. [tools/package_ha.py](../tools/package_ha.py) generates a custom integration archive from it and the client wheel; there is no second manually maintained implementation. This layout is for direct installation, not HACS.
@@ -48,8 +60,8 @@ On 2026-09-24, testing against HA 2026.9.3 / HAOS 18.3 and an A19-C1 running fir
 
 Five control measurements took 1.52–2.14 seconds from HA service call through the independent verification query. These are protocol round-trip measurements, not optical response latency.
 
-Initial validation passed 14 client tests and 50 HA integration tests (including 21 snapshots), plus all applicable Core hooks for the changed files: Ruff, formatting, spelling, JSON, mypy, pylint, requirements generation, and hassfest. A repository-wide hook run failed on an unrelated duplicate `homeassistant.util.event_type` module (`.py` / `.pyi`); its long-running whole-repository pylint process was stopped after the focused checks passed.
+Validation passed 15 client tests and 59 HA integration tests (including 21 snapshots). Applicable Core hooks for the changed files cover Ruff, formatting, spelling, JSON, mypy, pylint, requirements generation, and hassfest. Whole-repository validation encounters existing errors outside this integration; these results do not establish a clean repository-wide run.
 
-Automated tests cover response validation, retained/stale reply rejection, reconnect, missing-reply recovery, command confirmation failures, state preservation, and shutdown. Core tests cover capabilities without a temperature reading, unit conversion, stale HTTP/WebSocket isolation, options validation, unavailable startup, unload cleanup, and preserving account refresh scheduling during frequent native reports.
+Automated tests cover response validation, retained/stale reply rejection, reconnect, missing-reply recovery, command confirmation failures, state preservation, and shutdown. Core tests cover capabilities without a temperature reading, color conversion and confirmed readback, stale HTTP/WebSocket isolation, options validation, unavailable startup, unload cleanup, account refresh scheduling, reauthentication, account mismatch rejection, and isolation/recovery of native setup failures.
 
 The bundled-credential update adds a fifteenth client test verifying that the real packaged certificate/key load while preserving server verification. The built wheel was checked for inclusion of exactly the shared pair and successfully loaded directly as a ZIP package; account tokens and other private files are excluded.
