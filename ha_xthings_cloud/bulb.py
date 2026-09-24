@@ -245,6 +245,11 @@ class NativeBulbClient:
                     await self._publish(
                         "CC", "se", desired, secrets.randbelow(2**31 - 1) + 1
                     )
+                    if "pw" in changes or "br" in changes:
+                        # The device can lose replies when commands overlap.
+                        await self._confirm_state(
+                            {k: v for k, v in changes.items() if k != "pw"}
+                        )
                 if "pw" in changes or "br" in changes:
                     # Scene commands do not reliably change power on A19-C1.
                     await self._publish(
@@ -256,12 +261,23 @@ class NativeBulbClient:
             except aiomqtt.MqttError as err:
                 self._set_state(None)
                 raise XthingsCloudApiError("Bulb command failed") from err
-            for _ in range(3):
+            return await self._confirm_state(changes)
+
+    async def _confirm_state(self, changes: dict[str, int]) -> dict[str, int]:
+        """Confirm settings with bounded fresh queries, without replaying writes."""
+        for attempt in range(3):
+            try:
                 state = await self._sync()
+            except XthingsCloudApiError:
+                # A dropped reply must not abort the confirmation retries.
+                if attempt == 2:
+                    raise
+            else:
                 if all(state[k] == v for k, v in changes.items()):
                     return state
+            if attempt < 2:
                 await asyncio.sleep(0.2)
-            raise XthingsCloudApiError("Bulb did not confirm the requested settings")
+        raise XthingsCloudApiError("Bulb did not confirm the requested settings")
 
     async def _sync(self) -> dict[str, int]:
         mid = secrets.randbelow(2**31 - 1) + 1

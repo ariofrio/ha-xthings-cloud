@@ -10,7 +10,7 @@ The transport is **cloud MQTT**, not a LAN or Bluetooth connection. It requires 
 
 Startup and reconnect perform a fresh query. A health query runs approximately every 30 seconds, and recognized notifications trigger an earlier query. A failed query marks the bulb unavailable; subsequent successful queries restore availability. Changes made outside HA can therefore take roughly one polling interval plus network time to appear. This is bounded retry behavior, not a guarantee that an offline device or unavailable cloud service will answer.
 
-Commands read the current state, preserve unrelated settings, send `CC/pw` for power/brightness and `CC/se` for color/temperature, and require fresh readback matching the requested fields. A broker acknowledgement alone does not confirm success. Unconfirmed commands raise an error; the requested state is never substituted for the observed state. Independent controllers can still race with the read/modify/write sequence because the protocol has no known conditional-write primitive.
+Commands read the current state, preserve unrelated settings, send `CC/pw` for power/brightness and `CC/se` for color/temperature, and require fresh readback matching the requested fields. Combined controls confirm the scene settings before sending power/brightness, so the device is not given overlapping commands. A lost confirmation response triggers another fresh query, up to three attempts, without resending the setting commands. A broker acknowledgement alone does not confirm success. Unconfirmed commands raise an error; the requested state is never substituted for the observed state. Independent controllers can still race with the read/modify/write sequence because the protocol has no known conditional-write primitive.
 
 The tested native fields are power (`pw`), brightness (`br`), mode (`ct`), temperature slider (`tp`), and HSL color (`hu`, `sa`, `li`). HA converts HSL to its HS representation and maps temperature settings 1–100 linearly to the advertised 2700–6500 K range. **Intermediate Kelvin values are approximate, not measured color temperatures.** Legacy slider value 0 is displayed at the warm endpoint; new HA commands use 1–100.
 
@@ -37,7 +37,7 @@ The Core source remains the development source. [tools/package_ha.py](../tools/p
 3. From the client checkout, package it:
 
    ```sh
-   python tools/package_ha.py /path/to/core dist/ha_xthings_cloud-1.0.6.dev3-py3-none-any.whl dist/xthings_cloud.tar.gz
+   python tools/package_ha.py /path/to/core dist/ha_xthings_cloud-1.0.6.dev4-py3-none-any.whl dist/xthings_cloud.tar.gz
    ```
 
 4. Create an HA backup. If an `xthings_cloud` custom integration already exists, preserve it before replacing it. Extract the archive into HA's `/config`; it creates `/config/custom_components/xthings_cloud/` and bundles the wheel there. The generated manifest references that local wheel.
@@ -61,8 +61,8 @@ On 2026-09-24, testing against HA 2026.9.3 / HAOS 18.3 and four A19-C1 bulbs run
 
 Five control measurements took 1.52–2.14 seconds from HA service call through the independent verification query. These are protocol round-trip measurements, not optical response latency.
 
-Validation passed 18 client tests and 59 HA integration tests (including 21 snapshots). Applicable Core hooks for the changed files cover Ruff, formatting, spelling, JSON, mypy, pylint, requirements generation, and hassfest. Whole-repository validation encounters existing errors outside this integration; these results do not establish a clean repository-wide run.
+Validation passed 22 client tests and 59 HA integration tests (including 21 snapshots). Applicable Core hooks for the changed files cover Ruff, formatting, spelling, JSON, mypy, pylint, requirements generation, and hassfest. Whole-repository validation encounters existing errors outside this integration; these results do not establish a clean repository-wide run.
 
-Automated tests cover standalone/group route discovery, dedicated power commands (including combined power and color settings), response validation, retained/stale reply rejection, reconnect, missing-reply recovery, command confirmation failures, state preservation, and shutdown. Core tests cover capabilities without a temperature reading, color conversion and confirmed readback, stale HTTP/WebSocket isolation, options validation, unavailable startup, unload cleanup, account refresh scheduling, reauthentication, account mismatch rejection, and isolation/recovery of native setup failures.
+Automated tests cover standalone/group route discovery, dedicated power commands (including combined power and color settings), response validation, retained/stale reply rejection, reconnect, missing-reply recovery, lost confirmation replies, command confirmation failures, state preservation, and shutdown. Core tests cover capabilities without a temperature reading, color conversion and confirmed readback, stale HTTP/WebSocket isolation, options validation, unavailable startup, unload cleanup, account refresh scheduling, reauthentication, account mismatch rejection, and isolation/recovery of native setup failures.
 
 The client suite also verifies that the real packaged certificate/key load while preserving server verification. The built wheel was checked for inclusion of exactly the shared pair and successfully loaded directly as a ZIP package; account tokens and other private files are excluded.

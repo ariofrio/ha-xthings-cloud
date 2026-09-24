@@ -25,6 +25,8 @@ class Broker:
         self.ignore_commands = False
         self.connections = 0
         self.reply_topic = 1
+        self.lost_reads_after_command = 0
+        self.lost_reads_remaining = 0
 
     def client(self, **kwargs):
         return self
@@ -59,6 +61,7 @@ class Broker:
         self.requests.append(request)
         assert len(self.subscriptions) == 2
         if request["hd"]["np"] == "CC":
+            self.lost_reads_remaining = self.lost_reads_after_command
             if not self.ignore_commands:
                 if request["hd"]["na"] == "pw":
                     self.state["pw"] = request["pd"]["pw"]
@@ -71,6 +74,9 @@ class Broker:
             return
         if self.drop:
             return
+        if self.lost_reads_remaining:
+            self.lost_reads_remaining -= 1
+            request["hd"]["md"] = -1
         await self.queue.put(
             SimpleNamespace(
                 topic=self.subscriptions[self.reply_topic],
@@ -302,5 +308,64 @@ async def test_power_control_preserves_settings(monkeypatch, initial_power, chan
         power = [r for r in broker.requests if r["hd"]["na"] == "pw"]
         assert len(power) == 1
         assert power[0]["pd"] == {"pw": changes["pw"], "br": changes.get("br", 255)}
+    finally:
+        await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_reads", [1, 2])
+async def test_command_retries_lost_confirmation_without_resending(
+    monkeypatch, lost_reads
+):
+    broker = Broker()
+    broker.lost_reads_after_command = lost_reads
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    reports = []
+    bulb = NativeBulbClient(
+        "bulb", 123, ssl.create_default_context(), reports.append, timeout=0.03
+    )
+    try:
+        await bulb.async_start()
+        reports.clear()
+        state = await bulb.async_set_state({"pw": 1, "br": 15, "ct": 1, "tp": 11})
+        assert state == {**STATE, "br": 15, "tp": 11}
+        assert None in reports
+        assert reports[-1] == state
+        commands = [r for r in broker.requests if r["hd"]["np"] == "CC"]
+        assert len(commands) == 2
+    finally:
+        await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_command_without_any_confirmation_stays_unavailable(monkeypatch):
+    broker = Broker()
+    broker.lost_reads_after_command = 100
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    bulb = NativeBulbClient(
+        "bulb", 123, ssl.create_default_context(), lambda s: None, timeout=0.03
+    )
+    try:
+        await bulb.async_start()
+        with pytest.raises(XthingsCloudApiError, match="No confirmed response"):
+            await bulb.async_set_state({"pw": 1, "br": 15, "ct": 1, "tp": 11})
+        assert bulb.state is None
+        assert len([r for r in broker.requests if r["hd"]["np"] == "CC"]) == 1
+    finally:
+        await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_combined_control_confirms_scene_before_power(monkeypatch):
+    broker = Broker()
+    broker.state["pw"] = 0
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    bulb = NativeBulbClient("bulb", 123, ssl.create_default_context(), lambda s: None)
+    try:
+        await bulb.async_start()
+        result = await bulb.async_set_state({"pw": 1, "br": 15, "ct": 1, "tp": 11})
+        assert result == {**STATE, "br": 15, "tp": 11}
+        names = [r["hd"]["na"] for r in broker.requests]
+        assert names[names.index("se") : names.index("pw") + 1] == ["se", "sy", "pw"]
     finally:
         await bulb.async_stop()
