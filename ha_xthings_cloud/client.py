@@ -31,7 +31,7 @@ from .const import (
     AUTH_ERROR_CODES,
 )
 from .exceptions import XthingsCloudApiError, XthingsCloudAuthError
-from .bulb import SUPPORTED_MODELS
+from .bulb import SUPPORTED_MODELS, NativeBulbRoute
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -170,10 +170,10 @@ class XthingsCloudApiClient:
         """Get single device status."""
         return await self._request(API_DEVICE_STATUS, json={"id": device_id})
 
-    async def async_get_native_bulb_routes(self) -> dict[str, int]:
+    async def async_get_native_bulb_routes(self) -> dict[str, NativeBulbRoute]:
         """Discover supported bulb routing via the authenticated app API.
 
-        Return only UUID/address pairs; discard unrelated app metadata.
+        Return command addresses and group response routes; discard other metadata.
         """
         async def request(path: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
             try:
@@ -199,7 +199,13 @@ class XthingsCloudApiClient:
             for room in await request("room", {"id": address["id"]}):
                 for device in await request("device/list", {"room_id": room["id"]}):
                     if device.get("model") in SUPPORTED_MODELS:
-                        routes[device["uuid"]] = address["id"]
+                        routes[device["uuid"]] = NativeBulbRoute(address["id"])
+                    elif device.get("entry_type") == "Britegroup":
+                        for bulb in device.get("lights", []):
+                            if bulb.get("model") in SUPPORTED_MODELS:
+                                routes[bulb["uuid"]] = NativeBulbRoute(
+                                    address["id"], device["uuid"]
+                                )
         return routes
 
     # ---- Switch ----

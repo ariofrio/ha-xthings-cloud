@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ha-xthings-cloud"
-version = "1.0.6.dev2"
+version = "1.0.6.dev3"
 description = "Async Python client for Xthings Cloud API"
 readme = "README.md"
 license = {text = "Apache-2.0"}

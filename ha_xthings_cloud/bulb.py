@@ -11,6 +11,7 @@ import secrets
 import ssl
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from importlib.resources import as_file, files
 
 import aiomqtt
@@ -28,6 +29,14 @@ RANGES = {
     "sa": (0, 100),
     "li": (0, 100),
 }
+
+
+@dataclass(frozen=True)
+class NativeBulbRoute:
+    """Address command route and optional group-specific response route."""
+
+    address_id: int
+    group_id: str | None = None
 
 
 def create_bulb_ssl_context() -> ssl.SSLContext:
@@ -62,7 +71,7 @@ class NativeBulbClient:
     def __init__(
         self,
         device_id: str,
-        address_id: int,
+        address_id: int | NativeBulbRoute,
         tls_context: ssl.SSLContext,
         on_state: Callable[[dict[str, int] | None], None],
         *,
@@ -78,16 +87,29 @@ class NativeBulbClient:
             raise ValueError(
                 "MQTT requires server certificate and hostname verification"
             )
+        route = (
+            address_id
+            if isinstance(address_id, NativeBulbRoute)
+            else NativeBulbRoute(address_id)
+        )
+        if route.group_id is not None and (
+            not route.group_id or any(c in route.group_id for c in "/+#")
+        ):
+            raise ValueError("Invalid group ID")
         self._device_id = device_id
         self._tls = tls_context
         self._on_state = on_state
         self._timeout = timeout
         self._poll_interval = poll_interval
         self._sid = secrets.randbelow(86400)
-        prefix = f"utec/lightness/only/{device_id}"
+        prefix = (
+            f"utec/lightness/group/{route.group_id}/{device_id}"
+            if route.group_id is not None
+            else f"utec/lightness/only/{device_id}"
+        )
         self._notify = f"{prefix}/notify"
         self._accept = f"{prefix}/accept/{self._sid}"
-        self._command = f"utec/lightness/{address_id}/{device_id}/command"
+        self._command = f"utec/lightness/{route.address_id}/{device_id}/command"
         self._client: aiomqtt.Client | None = None
         self._task: asyncio.Task | None = None
         self._connected = asyncio.Event()
@@ -219,9 +241,18 @@ class NativeBulbClient:
             state = await self._sync()
             desired = {**state, **changes}
             try:
-                await self._publish(
-                    "CC", "se", desired, secrets.randbelow(2**31 - 1) + 1
-                )
+                if changes.keys() - {"pw", "br"}:
+                    await self._publish(
+                        "CC", "se", desired, secrets.randbelow(2**31 - 1) + 1
+                    )
+                if "pw" in changes or "br" in changes:
+                    # Scene commands do not reliably change power on A19-C1.
+                    await self._publish(
+                        "CC",
+                        "pw",
+                        {"pw": desired["pw"], "br": changes.get("br", 255)},
+                        secrets.randbelow(2**31 - 1) + 1,
+                    )
             except aiomqtt.MqttError as err:
                 self._set_state(None)
                 raise XthingsCloudApiError("Bulb command failed") from err

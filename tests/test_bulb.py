@@ -20,6 +20,7 @@ class Broker:
         self.queue = asyncio.Queue()
         self.subscriptions = []
         self.requests = []
+        self.topics = set()
         self.drop = False
         self.ignore_commands = False
         self.connections = 0
@@ -53,12 +54,20 @@ class Broker:
         return message
 
     async def publish(self, topic, payload, **kwargs):
+        self.topics.add(topic)
         request = json.loads(payload)
         self.requests.append(request)
         assert len(self.subscriptions) == 2
         if request["hd"]["np"] == "CC":
             if not self.ignore_commands:
-                self.state.update(request["pd"])
+                if request["hd"]["na"] == "pw":
+                    self.state["pw"] = request["pd"]["pw"]
+                    if request["pd"]["br"] != 255:
+                        self.state["br"] = request["pd"]["br"]
+                else:
+                    self.state.update(
+                        {k: v for k, v in request["pd"].items() if k != "pw"}
+                    )
             return
         if self.drop:
             return
@@ -271,3 +280,27 @@ def test_bundled_tls_credentials_load_with_server_verification():
     assert context.check_hostname is True
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.cert_store_stats()["x509_ca"] > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial_power,changes",
+    [
+        (1, {"pw": 0}),
+        (0, {"pw": 1}),
+        (0, {"pw": 1, "br": 42, "ct": 1, "tp": 100}),
+    ],
+)
+async def test_power_control_preserves_settings(monkeypatch, initial_power, changes):
+    broker = Broker()
+    broker.state["pw"] = initial_power
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    bulb = NativeBulbClient("bulb", 123, ssl.create_default_context(), lambda s: None)
+    try:
+        await bulb.async_start()
+        assert await bulb.async_set_state(changes) == {**STATE, **changes}
+        power = [r for r in broker.requests if r["hd"]["na"] == "pw"]
+        assert len(power) == 1
+        assert power[0]["pd"] == {"pw": changes["pw"], "br": changes.get("br", 255)}
+    finally:
+        await bulb.async_stop()
