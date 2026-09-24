@@ -29,6 +29,8 @@ RANGES = {
     "sa": (0, 100),
     "li": (0, 100),
 }
+# Consecutive failed queries before a connected bulb is reported unavailable.
+FAILED_QUERY_LIMIT = 3
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,10 @@ def create_bulb_ssl_context() -> ssl.SSLContext:
     return context
 
 
+def _new_mid() -> int:
+    return secrets.randbelow(2**31 - 1) + 1
+
+
 def _valid_state(state: object) -> bool:
     return isinstance(state, dict) and all(
         type(state.get(key)) is int and low <= state[key] <= high
@@ -77,6 +83,7 @@ class NativeBulbClient:
         *,
         timeout: float = 5,
         poll_interval: float = 30,
+        retry_interval: float = 2,
     ) -> None:
         if any(c in device_id for c in "/+#") or not device_id:
             raise ValueError("Invalid device ID")
@@ -101,6 +108,7 @@ class NativeBulbClient:
         self._on_state = on_state
         self._timeout = timeout
         self._poll_interval = poll_interval
+        self._retry_interval = retry_interval
         self._sid = secrets.randbelow(86400)
         prefix = (
             f"utec/lightness/group/{route.group_id}/{device_id}"
@@ -118,6 +126,8 @@ class NativeBulbClient:
         self._lock = asyncio.Lock()
         self._pending: dict[int, asyncio.Future] = {}
         self._state: dict[str, int] | None = None
+        self._failed_queries = 0
+        self._confirmed_at = 0.0
         self._controls: set[asyncio.Task] = set()
         self._queued_control: asyncio.Task | None = None
         self._queued_changes: dict[str, int] = {}
@@ -224,13 +234,29 @@ class NativeBulbClient:
             self._changed.set()
 
     async def _monitor(self) -> None:
+        loop = asyncio.get_running_loop()
         while True:
             self._changed.clear()
-            with suppress(XthingsCloudApiError):
+            failed = False
+            try:
                 await self.async_refresh()
+            except XthingsCloudApiError:
+                failed = True
             self._initial.set()
-            with suppress(TimeoutError):
-                await asyncio.wait_for(self._changed.wait(), self._poll_interval)
+            while not self._changed.is_set():
+                # Retry failures promptly; otherwise poll only when no command
+                # has confirmed the state within the polling interval.
+                wait = (
+                    self._retry_interval
+                    if failed
+                    else self._confirmed_at + self._poll_interval - loop.time()
+                )
+                if wait <= 0:
+                    break
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(self._changed.wait(), wait)
+                if failed:
+                    break
             await asyncio.sleep(0.1)
 
     async def async_refresh(self) -> dict[str, int]:
@@ -252,18 +278,8 @@ class NativeBulbClient:
             low, high = RANGES[key]
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"Invalid {key} setting")
-        queued = self._queued_changes
-        if (
-            self._queued_control is not None
-            and changes.keys() != {"pw"}
-            and queued.keys() != {"pw"}
-            and (
-                "pw" not in changes
-                or "pw" not in queued
-                or changes["pw"] == queued["pw"]
-            )
-        ):
-            queued.update(changes)
+        if self._can_merge(changes):
+            self._queued_changes.update(changes)
             control = self._queued_control
         else:
             self._queued_changes = dict(changes)
@@ -272,6 +288,20 @@ class NativeBulbClient:
             self._controls.add(control)
             control.add_done_callback(self._control_done)
         return dict(await asyncio.shield(control))
+
+    def _can_merge(self, changes: dict[str, int]) -> bool:
+        """Whether changes can join the pending command without reordering power."""
+        queued = self._queued_changes
+        return (
+            self._queued_control is not None
+            and changes.keys() != {"pw"}
+            and queued.keys() != {"pw"}
+            and (
+                "pw" not in changes
+                or "pw" not in queued
+                or changes["pw"] == queued["pw"]
+            )
+        )
 
     def _control_done(self, control: asyncio.Task) -> None:
         self._controls.discard(control)
@@ -285,29 +315,34 @@ class NativeBulbClient:
                 self._queued_control = None
                 self._queued_changes = {}
             scene = bool(changes.keys() - {"pw", "br"})
-            state = await self._sync() if scene or "pw" not in changes else {}
-            desired = {**state, **changes}
+            # Scene commands carry every field. Fill unrelated fields from the
+            # last confirmed state; changes made outside HA since then may be
+            # overwritten. Read first only when no confirmed state is known.
+            state = self._state
+            if state is None and (scene or "pw" not in changes):
+                state = await self._sync()
+            desired = {**(state or {}), **changes}
             try:
                 await asyncio.wait_for(self._connected.wait(), self._timeout)
                 if scene:
-                    await self._publish(
-                        "CC", "se", desired, secrets.randbelow(2**31 - 1) + 1
+                    await self._publish("CC", "se", desired, _new_mid())
+                    if "pw" not in changes and "br" not in changes:
+                        return await self._confirm_state(changes)
+                    # The device can lose replies when commands overlap.
+                    state = await self._confirm_state(
+                        {k: v for k, v in changes.items() if k != "pw"}
                     )
-                    if "pw" in changes or "br" in changes:
-                        # The device can lose replies when commands overlap.
-                        await self._confirm_state(
-                            {k: v for k, v in changes.items() if k != "pw"}
-                        )
-                if "pw" in changes or "br" in changes:
-                    # Scene commands do not reliably change power on A19-C1.
-                    await self._publish(
-                        "CC",
-                        "pw",
-                        {"pw": desired["pw"], "br": changes.get("br", 255)},
-                        secrets.randbelow(2**31 - 1) + 1,
-                    )
+                    if state["pw"] == desired["pw"]:
+                        # The scene already applied brightness to a lit bulb.
+                        return state
+                # Scene commands do not reliably change power on A19-C1.
+                await self._publish(
+                    "CC",
+                    "pw",
+                    {"pw": desired["pw"], "br": changes.get("br", 255)},
+                    _new_mid(),
+                )
             except (TimeoutError, aiomqtt.MqttError) as err:
-                self._set_state(None)
                 raise XthingsCloudApiError("Bulb command failed") from err
             return await self._confirm_state(changes)
 
@@ -328,7 +363,7 @@ class NativeBulbClient:
         raise XthingsCloudApiError("Bulb did not confirm the requested settings")
 
     async def _sync(self) -> dict[str, int]:
-        mid = secrets.randbelow(2**31 - 1) + 1
+        mid = _new_mid()
         future = asyncio.get_running_loop().create_future()
         try:
             await asyncio.wait_for(self._connected.wait(), self._timeout)
@@ -336,7 +371,9 @@ class NativeBulbClient:
             await self._publish("FC", "sy", {}, mid)
             state = await asyncio.wait_for(future, self._timeout)
         except (TimeoutError, aiomqtt.MqttError, XthingsCloudApiError) as err:
-            self._set_state(None)
+            self._failed_queries += 1
+            if self._failed_queries >= FAILED_QUERY_LIMIT:
+                self._set_state(None)
             raise XthingsCloudApiError("No confirmed response from bulb") from err
         finally:
             self._pending.pop(mid, None)
@@ -345,6 +382,8 @@ class NativeBulbClient:
             elif not future.cancelled():
                 # Disconnect can complete the future while publish is cancelled.
                 future.exception()
+        self._failed_queries = 0
+        self._confirmed_at = asyncio.get_running_loop().time()
         self._set_state(state)
         return dict(state)
 
