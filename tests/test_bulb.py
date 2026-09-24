@@ -676,3 +676,72 @@ async def test_prompt_reply_needs_no_backup_query(monkeypatch):
         assert [r["hd"]["na"] for r in broker.requests] == ["sy"]
     finally:
         await bulb.async_stop()
+
+
+class BlockFirstCommandBroker(Broker):
+    """Hold the first command so that later commands queue behind it."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered, self.release = asyncio.Event(), asyncio.Event()
+        self.fail_later_commands = False
+
+    async def publish(self, topic, payload, **kwargs):
+        header = json.loads(payload)["hd"]
+        if header["np"] == "CC":
+            if not self.entered.is_set():
+                self.entered.set()
+                await self.release.wait()
+            elif self.fail_later_commands:
+                raise aiomqtt.MqttError("publish failed")
+        await super().publish(topic, payload, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_superseded_confirmation_is_not_reported(monkeypatch):
+    broker = BlockFirstCommandBroker()
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    reports = []
+    bulb = NativeBulbClient("bulb", 123, ssl.create_default_context(), reports.append)
+    try:
+        await bulb.async_start()
+        reports.clear()
+        first = asyncio.create_task(bulb.async_set_state({"pw": 1, "br": 10}))
+        await asyncio.wait_for(broker.entered.wait(), 1)
+        second = asyncio.create_task(bulb.async_set_state({"pw": 1, "br": 69}))
+        await asyncio.sleep(0)
+        # A power change is never merged, so it queues behind the first command.
+        third = asyncio.create_task(bulb.async_set_state({"pw": 0}))
+        await asyncio.sleep(0)
+        broker.release.set()
+        await asyncio.gather(first, second, third)
+        # Each earlier confirmation was already superseded; HA sees only the last.
+        assert reports == [{**STATE, "br": 69, "pw": 0}]
+    finally:
+        broker.release.set()
+        await bulb.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_held_state_is_reported_when_queued_command_fails(monkeypatch):
+    broker = BlockFirstCommandBroker()
+    broker.fail_later_commands = True
+    monkeypatch.setattr("ha_xthings_cloud.bulb.aiomqtt.Client", broker.client)
+    reports = []
+    bulb = NativeBulbClient("bulb", 123, ssl.create_default_context(), reports.append)
+    try:
+        await bulb.async_start()
+        reports.clear()
+        first = asyncio.create_task(bulb.async_set_state({"pw": 1, "br": 10}))
+        await asyncio.wait_for(broker.entered.wait(), 1)
+        second = asyncio.create_task(bulb.async_set_state({"pw": 0}))
+        await asyncio.sleep(0)
+        broker.release.set()
+        assert await first == {**STATE, "br": 10}
+        with pytest.raises(XthingsCloudApiError, match="command failed"):
+            await second
+        # The failed command cannot leave HA showing a value never confirmed.
+        assert reports == [{**STATE, "br": 10}]
+    finally:
+        broker.release.set()
+        await bulb.async_stop()

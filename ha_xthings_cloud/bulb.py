@@ -130,6 +130,7 @@ class NativeBulbClient:
         self._state: dict[str, int] | None = None
         self._failed_queries = 0
         self._confirmed_at = 0.0
+        self._state_held = False
         self._controls: set[asyncio.Task] = set()
         self._queued_control: asyncio.Task | None = None
         self._queued_changes: dict[str, int] = {}
@@ -141,7 +142,18 @@ class NativeBulbClient:
 
     def _set_state(self, state: dict[str, int] | None) -> None:
         self._state = state
+        if state is not None and self._queued_control is not None:
+            # A queued command will change this state again. Reporting it now
+            # would move HA's controls back to an already superseded value.
+            self._state_held = True
+            return
+        self._state_held = False
         self._on_state(self.state)
+
+    def _report_held_state(self) -> None:
+        if self._state_held and self._queued_control is None:
+            self._state_held = False
+            self._on_state(self.state)
 
     async def async_start(self) -> None:
         """Start recovery and health polling; await the first bounded attempt."""
@@ -316,37 +328,44 @@ class NativeBulbClient:
             if self._queued_control is asyncio.current_task():
                 self._queued_control = None
                 self._queued_changes = {}
-            scene = bool(changes.keys() - {"pw", "br"})
-            # Scene commands carry every field. Fill unrelated fields from the
-            # last confirmed state; changes made outside HA since then may be
-            # overwritten. Read first only when no confirmed state is known.
-            state = self._state
-            if state is None and (scene or "pw" not in changes):
-                state = await self._sync()
-            desired = {**(state or {}), **changes}
             try:
-                await asyncio.wait_for(self._connected.wait(), self._timeout)
-                if scene:
-                    await self._publish("CC", "se", desired, _new_mid())
-                    if "pw" not in changes and "br" not in changes:
-                        return await self._confirm_state(changes)
-                    # The device can lose replies when commands overlap.
-                    state = await self._confirm_state(
-                        {k: v for k, v in changes.items() if k != "pw"}
-                    )
-                    if state["pw"] == desired["pw"]:
-                        # The scene already applied brightness to a lit bulb.
-                        return state
-                # Scene commands do not reliably change power on A19-C1.
-                await self._publish(
-                    "CC",
-                    "pw",
-                    {"pw": desired["pw"], "br": changes.get("br", 255)},
-                    _new_mid(),
+                return await self._send_and_confirm(changes)
+            finally:
+                # A failed command must not leave a superseded value unreported.
+                self._report_held_state()
+
+    async def _send_and_confirm(self, changes: dict[str, int]) -> dict[str, int]:
+        scene = bool(changes.keys() - {"pw", "br"})
+        # Scene commands carry every field. Fill unrelated fields from the
+        # last confirmed state; changes made outside HA since then may be
+        # overwritten. Read first only when no confirmed state is known.
+        state = self._state
+        if state is None and (scene or "pw" not in changes):
+            state = await self._sync()
+        desired = {**(state or {}), **changes}
+        try:
+            await asyncio.wait_for(self._connected.wait(), self._timeout)
+            if scene:
+                await self._publish("CC", "se", desired, _new_mid())
+                if "pw" not in changes and "br" not in changes:
+                    return await self._confirm_state(changes)
+                # The device can lose replies when commands overlap.
+                state = await self._confirm_state(
+                    {k: v for k, v in changes.items() if k != "pw"}
                 )
-            except (TimeoutError, aiomqtt.MqttError) as err:
-                raise XthingsCloudApiError("Bulb command failed") from err
-            return await self._confirm_state(changes)
+                if state["pw"] == desired["pw"]:
+                    # The scene already applied brightness to a lit bulb.
+                    return state
+            # Scene commands do not reliably change power on A19-C1.
+            await self._publish(
+                "CC",
+                "pw",
+                {"pw": desired["pw"], "br": changes.get("br", 255)},
+                _new_mid(),
+            )
+        except (TimeoutError, aiomqtt.MqttError) as err:
+            raise XthingsCloudApiError("Bulb command failed") from err
+        return await self._confirm_state(changes)
 
     async def _confirm_state(self, changes: dict[str, int]) -> dict[str, int]:
         """Confirm settings with bounded fresh queries, without replaying writes."""
