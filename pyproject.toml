@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ha-xthings-cloud"
-version = "1.0.5"
+version = "1.0.6.dev1"
 description = "Async Python client for Xthings Cloud API"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -26,6 +26,7 @@ classifiers = [
     "Topic :: Home Automation",
 ]
 dependencies = [
+    "aiomqtt>=2.5.1,<3",
     "aiohttp>=3.8.0",
     "PyJWT>=2.0.0",
 ]

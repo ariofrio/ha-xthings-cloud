@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -30,6 +31,7 @@ from .const import (
     AUTH_ERROR_CODES,
 )
 from .exceptions import XthingsCloudApiError, XthingsCloudAuthError
+from .bulb import SUPPORTED_MODELS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -167,6 +169,38 @@ class XthingsCloudApiClient:
     async def async_get_device_status(self, device_id: str) -> dict[str, Any]:
         """Get single device status."""
         return await self._request(API_DEVICE_STATUS, json={"id": device_id})
+
+    async def async_get_native_bulb_routes(self) -> dict[str, int]:
+        """Discover supported bulb routing via the authenticated app API.
+
+        Return only UUID/address pairs; discard unrelated app metadata.
+        """
+        async def request(path: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+            try:
+                response = await self._session.request(
+                    "POST", f"https://cloud.u-tec.com/app/{path}",
+                    data={"token": self._token,
+                          "data": json.dumps({**payload, "timestamp": str(time.time())})},
+                    timeout=aiohttp.ClientTimeout(total=15), allow_redirects=False,
+                )
+                response.raise_for_status()
+                result = await response.json()
+            except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+                raise XthingsCloudApiError("Native device discovery failed") from err
+            code = result.get("code")
+            if code in AUTH_ERROR_CODES:
+                raise XthingsCloudAuthError("Native discovery authentication failed", code)
+            if code != 200 or not isinstance(result.get("data"), list):
+                raise XthingsCloudApiError("Invalid native discovery response")
+            return result["data"]
+
+        routes = {}
+        for address in await request("address", {}):
+            for room in await request("room", {"id": address["id"]}):
+                for device in await request("device/list", {"room_id": room["id"]}):
+                    if device.get("model") in SUPPORTED_MODELS:
+                        routes[device["uuid"]] = address["id"]
+        return routes
 
     # ---- Switch ----
 

@@ -2,6 +2,10 @@
 
 Async Python client for the [Xthings Cloud](https://cloud.xthings.com) API, designed for [Home Assistant](https://www.home-assistant.io/) integration.
 
+## Experimental A19-C1 extension
+
+This fork adds optional native cloud MQTT readback and confirmed controls for the A19-C1 bulb. See [protocol behavior, installation, limitations, and validation](docs/native-bulb.md). TLS credentials are supplied privately by the caller.
+
 ## Installation
 
 ```bash
