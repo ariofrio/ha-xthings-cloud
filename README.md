@@ -4,7 +4,7 @@ Async Python client for the [Xthings Cloud](https://cloud.xthings.com) API, desi
 
 ## Experimental A19-C1 extension
 
-This fork adds optional native cloud MQTT readback and confirmed controls for the A19-C1 bulb. See [protocol behavior, installation, limitations, and validation](docs/native-bulb.md). TLS credentials are supplied privately by the caller.
+This fork adds optional native cloud MQTT readback and confirmed controls for the A19-C1 bulb. See [protocol behavior, installation, limitations, and validation](docs/native-bulb.md). The package includes the vendor app’s shared MQTT certificate/key; no personal account credentials are bundled.
 
 ## Installation
 

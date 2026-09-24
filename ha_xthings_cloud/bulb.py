@@ -1,6 +1,6 @@
 """Confirmed native MQTT state for the U-tec A19-C1.
 
-Credentials are supplied by the caller; no vendor private key is distributed.
+The bundled app credential authenticates native MQTT; it is shared, not per user.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import secrets
 import ssl
 from collections.abc import Callable
 from contextlib import suppress
+from importlib.resources import as_file, files
 
 import aiomqtt
 
@@ -27,6 +28,21 @@ RANGES = {
     "sa": (0, 100),
     "li": (0, 100),
 }
+
+
+def create_bulb_ssl_context() -> ssl.SSLContext:
+    """Load the bundled app identity with normal server/hostname verification.
+
+    This performs file I/O; async callers should run it in an executor.
+    """
+    context = ssl.create_default_context()
+    resources = files("ha_xthings_cloud").joinpath("certs")
+    with (
+        as_file(resources.joinpath("client-cert.pem")) as certificate,
+        as_file(resources.joinpath("client-key.pem")) as private_key,
+    ):
+        context.load_cert_chain(certificate, private_key)
+    return context
 
 
 def _valid_state(state: object) -> bool:

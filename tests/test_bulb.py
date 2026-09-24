@@ -262,3 +262,12 @@ async def test_shutdown_releases_inflight_read(monkeypatch):
             await read
     assert bulb.state is None
     assert reports[-1] is None
+
+
+def test_bundled_tls_credentials_load_with_server_verification():
+    from ha_xthings_cloud.bulb import create_bulb_ssl_context
+
+    context = create_bulb_ssl_context()
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.cert_store_stats()["x509_ca"] > 0
